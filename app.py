@@ -61,12 +61,12 @@ DELIVERY = {
 UNIT_OF_VALUE = ["Per location", "Per staff seat", "Per active member"]
 
 REVENUE_MODELS = {
-    "Subscription": {"trial": True, "paywall": "Core value behind paywall"},
+    "Subscription":      {"trial": True,  "paywall": "Core value behind paywall"},
     "One-time Purchase": {"trial": False, "paywall": "Updates/support separate"},
-    "Usage-based": {"trial": True, "paywall": "Pay per action/seat"},
-    "Freemium": {"trial": False, "paywall": "Basic free; value gates paid"},
-    "Tiered Access": {"trial": True, "paywall": "Good/Better/Best features"},
-    "Contracts": {"trial": Pilot := True, "paywall": "Annual B2B with pilot"},
+    "Usage-based":       {"trial": True,  "paywall": "Pay per action/seat"},
+    "Freemium":          {"trial": False, "paywall": "Basic free; value gates paid"},
+    "Tiered Access":     {"trial": True,  "paywall": "Good/Better/Best features"},
+    "Contracts":         {"trial": True,  "paywall": "Annual B2B with pilot"},
 }
 
 CHANNELS = {
