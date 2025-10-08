@@ -283,74 +283,104 @@ def score_run(history: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
     # Coherence: model vs segment vs delivery vs channels (quick heuristics)
     seg = SEGMENTS[S["segment"]]
     b2b = seg["b2b"]
-    channels_used = {k:v for k,v in S["gtm_alloc"].items() if v>0}
+    channels_used = {k: v for k, v in S["gtm_alloc"].items() if v > 0}
+    total_alloc = sum(channels_used.values()) if channels_used else 0
     big_channel = max(channels_used.values()) if channels_used else 0
-    b2b_fit = (channels_used.get("Outbound/Email",0) + channels_used.get("Events/Webinars",0)) >= 4 if b2b else (channels_used.get("Paid Social",0) + channels_used.get("Paid Search",0)) >= 4
+
+    # simple alignment heuristic: B2B likes Outbound/Events; B2C likes Paid Social/Search
+    b2b_fit = (
+        (channels_used.get("Outbound/Email", 0) + channels_used.get("Events/Webinars", 0)) >= 4
+        if b2b
+        else (channels_used.get("Paid Social", 0) + channels_used.get("Paid Search", 0)) >= 4
+    )
     delivery_ok = DELIVERY[S["delivery"]]["COGS_pct"] <= 0.4 or (S["price_tier"]["Better"] >= 119)
 
-    coherence = clamp((0.5 + 0.2*b2b_fit + 0.3*delivery_ok - 0.1*(big_channel > 0.6*sum(S["gtm_alloc"].values()))), 0, 1)
+    concentration_high = total_alloc > 0 and big_channel > 0.6 * total_alloc
+    coherence = clamp(
+        0.5 + 0.2 * (1 if b2b_fit else 0) + 0.3 * (1 if delivery_ok else 0) - 0.1 * (1 if concentration_high else 0),
+        0, 1
+    )
 
-    # Unit economics from Q4 (or last quarter run)
+    # Unit economics from last quarter (prefer Q4)
     last_q = max(history.keys()) if history else 1
     last = history[last_q]
     econ_ok = (
-        (last["ltv_cac"] >= 3.0) and
-        (last["gross_margin"] >= 0.60) and
-        (last["payback_m"] <= (15 if b2b else 9))
+        (last["ltv_cac"] >= 3.0)
+        and (last["gross_margin"] >= 0.60)
+        and (last["payback_m"] <= (15 if b2b else 9))
     )
-    unit_econ = clamp(0.3 + 0.5*(last["ltv_cac"]/4) + 0.2*(1 if econ_ok else 0), 0, 1)
+    unit_econ = clamp(0.3 + 0.5 * (last["ltv_cac"] / 4) + 0.2 * (1 if econ_ok else 0), 0, 1)
 
-    # GTM fit & focus: by Q2, no channel >60% volume and segment fit is used
-    q2 = history.get(2, last)
-    focus_penalty = 0.0
-    if sum(S["gtm_alloc"].values())>0 and max(S["gtm_alloc"].values()) > 0.6*sum(S["gtm_alloc"].values()):
-        focus_penalty = 0.2
+    # GTM fit & focus
+    focus_penalty = 0.2 if concentration_high else 0.0
     gtm_fit = clamp(0.7 - focus_penalty, 0, 1)
 
-    # Iteration quality: did Q2 improve binding constraint vs Q1?
+    # Iteration quality: Q2 vs Q1 deltas
     iter_score = 0.5
     if 1 in history and 2 in history:
-        if history[2]["payback_m"] < history[1]["payback_m"]: iter_score += 0.15
-        if history[2]["ltv_cac"] > history[1]["ltv_cac"]: iter_score += 0.15
-        if history[2]["ending_paid"] > history[1]["ending_paid"]: iter_score += 0.1
+        if history[2]["payback_m"] < history[1]["payback_m"]:
+            iter_score += 0.15
+        if history[2]["ltv_cac"] > history[1]["ltv_cac"]:
+            iter_score += 0.15
+        if history[2]["ending_paid"] > history[1]["ending_paid"]:
+            iter_score += 0.1
     iter_score = clamp(iter_score, 0, 1)
 
-    # Evidence plan: two tests provided and specific
+    # Evidence plan
     t1, t2 = S["notes_tests"]["t1"], S["notes_tests"]["t2"]
-    def is_specific(s): 
-        return any(x in s.lower() for x in ["target", "%", "pp", ">=", "<=", " by "]) and len(s.strip())>8
-    evidence = clamp(0.4 + 0.3*is_specific(t1) + 0.3*is_specific(t2), 0, 1)
 
-    total = round(100*(0.30*coherence + 0.30*unit_econ + 0.20*gtm_fit + 0.10*iter_score + 0.10*evidence))
+    def is_specific(s: str) -> bool:
+        s = (s or "").lower()
+        return any(x in s for x in ["target", "%", "pp", ">=", "<=", " by "]) and len(s.strip()) > 8
 
+    evidence = clamp(0.4 + 0.3 * is_specific(t1) + 0.3 * is_specific(t2), 0, 1)
+
+    total = round(100 * (0.30 * coherence + 0.30 * unit_econ + 0.20 * gtm_fit + 0.10 * iter_score + 0.10 * evidence))
+
+    # Explanations (no backslash-escaped quotes)
     reasons = {
-        "Model Coherence": ("Excellent" if coherence>=0.8 else "Good" if coherence>=0.6 else "Needs work") +
-            f" — Segment {'B2B' if b2b else 'B2C'} with channels {'well aligned' if b2b_fit else 'partly aligned'}; "
-            f"delivery {'supports' if delivery_ok else 'pressures'} margin; "
-            f\"concentration={'high' if big_channel > 0.6*sum(S['gtm_alloc'].values()) else 'balanced'}.\",
-        "Unit Economics": (
-            ("Excellent" if unit_econ>=0.8 else "Good" if unit_econ>=0.6 else "Needs work") +
-            f" — LTV/CAC={history[last_q]['ltv_cac']}, GM={int(history[last_q]['gross_margin']*100)}%, "
-            f"Payback={history[last_q]['payback_m']} mo."
+        "Model Coherence": (
+            ("Excellent" if coherence >= 0.8 else "Good" if coherence >= 0.6 else "Needs work")
+            + f" — Segment {'B2B' if b2b else 'B2C'} with channels "
+            + ("well aligned" if b2b_fit else "partly aligned")
+            + f"; delivery {'supports' if delivery_ok else 'pressures'} margin; "
+            + f"concentration={'high' if concentration_high else 'balanced'}."
         ),
-        "GTM Fit & Focus": ("Excellent" if gtm_fit>=0.8 else "Good" if gtm_fit>=0.6 else "Needs work") +
-            ("" if focus_penalty==0 else " — Heavy reliance on one channel (>60%) by Q2."),
-        "Iteration Quality": ("Excellent" if iter_score>=0.8 else "Good" if iter_score>=0.6 else "Needs work") +
-            (" — Q2 improved payback/LTV/CAC vs Q1." if (1 in history and 2 in history and (history[2]['payback_m']<history[1]['payback_m'] or history[2]['ltv_cac']>history[1]['ltv_cac'])) else " — Limited measurable improvement."),
-        "Evidence Plan": ("Excellent" if evidence>=0.8 else "Good" if evidence>=0.6 else "Needs work") +
-            (" — Both tests include targets." if (is_specific(t1) and is_specific(t2)) else " — Add clear targets/thresholds."),
+        "Unit Economics": (
+            ("Excellent" if unit_econ >= 0.8 else "Good" if unit_econ >= 0.6 else "Needs work")
+            + f" — LTV/CAC={last['ltv_cac']}, GM={int(last['gross_margin']*100)}%, "
+            + f"Payback={last['payback_m']} mo."
+        ),
+        "GTM Fit & Focus": (
+            ("Excellent" if gtm_fit >= 0.8 else "Good" if gtm_fit >= 0.6 else "Needs work")
+            + ("" if not concentration_high else " — Heavy reliance on one channel (>60%) by Q2.")
+        ),
+        "Iteration Quality": (
+            ("Excellent" if iter_score >= 0.8 else "Good" if iter_score >= 0.6 else "Needs work")
+            + (
+                " — Q2 improved payback/LTV/CAC vs Q1."
+                if (1 in history and 2 in history and
+                    (history[2]['payback_m'] < history[1]['payback_m'] or
+                     history[2]['ltv_cac'] > history[1]['ltv_cac']))
+                else " — Limited measurable improvement."
+            )
+        ),
+        "Evidence Plan": (
+            ("Excellent" if evidence >= 0.8 else "Good" if evidence >= 0.6 else "Needs work")
+            + (" — Both tests include targets." if (is_specific(t1) and is_specific(t2)) else " — Add clear targets/thresholds.")
+        ),
     }
 
     score = {
         "total": total,
         "components": {
-            "Model Coherence": round(coherence,2),
-            "Unit Economics": round(unit_econ,2),
-            "GTM Fit & Focus": round(gtm_fit,2),
-            "Iteration Quality": round(iter_score,2),
-            "Evidence Plan": round(evidence,2),
+            "Model Coherence": round(coherence, 2),
+            "Unit Economics": round(unit_econ, 2),
+            "GTM Fit & Focus": round(gtm_fit, 2),
+            "Iteration Quality": round(iter_score, 2),
+            "Evidence Plan": round(evidence, 2),
         },
-        "reasons": reasons
+        "reasons": reasons,
     }
     return score
 
