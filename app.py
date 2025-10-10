@@ -1,608 +1,968 @@
-# app_sim3.py
-# Startup Simulation #3 — Business Model Fit (Streamlit MVP)
-# Run: streamlit run app_sim3.py
-
+# app.py
 import math
 import random
-from copy import deepcopy
-from typing import Dict, List, Any
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
+import numpy as np
+import pandas as pd
 import streamlit as st
 
-random.seed(7)
-st.set_page_config(page_title="Simulation #3 — Business Model Fit", page_icon="📈", layout="wide")
-
-TITLE = "Simulation #3 — Business Model Fit"
-SUB = "Align segment, value prop, channels, and revenue mechanics through trade-offs"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Seed content
-# ──────────────────────────────────────────────────────────────────────────────
-MARKET_BRIEF = (
-    "Independent fitness market with varied studio types. Many classes have uneven attendance; "
-    "owners balance acquisition cost, retention, and staff load. Early signals show interest in "
-    "‘keep classes full’ outcomes, but willingness to pay and delivery cost vary by segment."
+# --------------------------------------------------------------------------------------
+# Page setup
+# --------------------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Simulation #3 — Business Model Fit (ThermaLoop)",
+    page_icon="📈",
+    layout="wide",
 )
 
+# ======================================================================================
+# DATA MODELS & CONSTANTS
+# ======================================================================================
+
 SEGMENTS = {
-    # elasticities: how sensitive conversions/churn are to price, paywall, time-to-value
-    "Specialty Studio (e.g., yoga, boxing)": {
-        "base_ARPU": 85, "price_elasticity": 0.9, "paywall_friction": 0.7, "ttv_sensitivity": 0.8,
-        "b2b": False, "churn_base": 0.035, "size_index": 1.0
+    "homeowner": {
+        "name": "Homeowners (B2C self-serve)",
+        # Base funnel (per 10k monthly visits; we’ll scale by channel volume)
+        "base_conv": {
+            "visit_to_trial": 0.06,
+            "trial_to_activation": 0.35,
+            "activation_to_paid": 0.20,
+            "retention_month_1": 0.86,  # 1-month retention prob
+        },
+        # Price elasticity (ARPU sensitivity); 1.0 = neutral
+        "price_elasticity": 1.15,
+        # Paywall friction baseline (higher = more drop between trial→activation)
+        "paywall_friction": 1.10,
+        # Churn drivers
+        "churn_sensitivity": {
+            "time_to_value": 1.10,  # slower TTV => more churn
+            "price": 1.05,          # higher price => more churn
+        },
+        # ARPU base (paid users)
+        "arpu_base": 11.0,  # $/mo
+        # Whether sales-led lifts retention/ACV if used (mostly B2B, so False here)
+        "sales_led_benefit": False,
     },
-    "Premium Amenities Studio": {
-        "base_ARPU": 129, "price_elasticity": 0.6, "paywall_friction": 0.4, "ttv_sensitivity": 0.6,
-        "b2b": False, "churn_base": 0.025, "size_index": 0.8
+    "landlord": {
+        "name": "Small Landlords (B2B light-sales)",
+        "base_conv": {
+            "visit_to_trial": 0.04,
+            "trial_to_activation": 0.42,
+            "activation_to_paid": 0.35,
+            "retention_month_1": 0.90,
+        },
+        "price_elasticity": 0.9,     # less elastic (can bear more price)
+        "paywall_friction": 0.95,    # less sensitive to paywalls
+        "churn_sensitivity": {
+            "time_to_value": 1.00,
+            "price": 1.02,
+        },
+        "arpu_base": 18.0,
+        "sales_led_benefit": True,
     },
-    "Budget Studio": {
-        "base_ARPU": 59, "price_elasticity": 1.2, "paywall_friction": 0.9, "ttv_sensitivity": 1.0,
-        "b2b": False, "churn_base": 0.045, "size_index": 1.3
-    },
-    "Corporate Wellness Partner": {
-        "base_ARPU": 240, "price_elasticity": 0.4, "paywall_friction": 0.5, "ttv_sensitivity": 0.5,
-        "b2b": True, "churn_base": 0.018, "size_index": 0.6
+    "installer": {
+        "name": "HVAC Installers (B2B2C pro tool)",
+        "base_conv": {
+            "visit_to_trial": 0.03,
+            "trial_to_activation": 0.48,
+            "activation_to_paid": 0.40,
+            "retention_month_1": 0.92,
+        },
+        "price_elasticity": 0.85,
+        "paywall_friction": 0.90,
+        "churn_sensitivity": {
+            "time_to_value": 0.95,  # less sensitive; workflow value is sticky
+            "price": 1.00,
+        },
+        "arpu_base": 24.0,
+        "sales_led_benefit": True,
     },
 }
 
-VALUE_OUTCOMES = [
-    "Keep classes ≥80% full",
-    "Cut staff scheduling time",
-    "Reduce churn",
-    "Grow high-value members",
-    "Automate promo timing",
-]
-PROOF_ELEMENTS = ["Customer quotes", "Before/After metrics", "Production demo", "ROI calculator", "Third-party review"]
-PROMISE = ["Conservative", "Balanced", "Bold"]
-DELIVERY = {
-    "Manual": {"COGS_pct": 0.45, "ttv_days": 14},
-    "Hybrid": {"COGS_pct": 0.30, "ttv_days": 7},
-    "Automated": {"COGS_pct": 0.18, "ttv_days": 3},
+DELIVERY_LEVELS = {
+    # impacts COGS per paid unit, Time-to-Value (TTV), Support load
+    "Manual": {"cogs_mult": 1.00, "ttv_days": 5, "support": "High"},
+    "Hybrid": {"cogs_mult": 0.75, "ttv_days": 3, "support": "Medium"},
+    "Automated": {"cogs_mult": 0.55, "ttv_days": 1, "support": "Low"},
 }
-UNIT_OF_VALUE = ["Per location", "Per staff seat", "Per active member"]
 
-REVENUE_MODELS = {
-    "Subscription":      {"trial": True,  "paywall": "Core value behind paywall"},
-    "One-time Purchase": {"trial": False, "paywall": "Updates/support separate"},
-    "Usage-based":       {"trial": True,  "paywall": "Pay per action/seat"},
-    "Freemium":          {"trial": False, "paywall": "Basic free; value gates paid"},
-    "Tiered Access":     {"trial": True,  "paywall": "Good/Better/Best features"},
-    "Contracts":         {"trial": True,  "paywall": "Annual B2B with pilot"},
+UNIT_OF_VALUE = ["per home", "per rental unit", "per installer seat/kit"]
+
+MODELS = {
+    "Hardware + Subscription": {"note": "Device margin + monthly SaaS. Higher upfront CAC acceptable."},
+    "Subscription only": {"note": "Pure SaaS. Lower upfront value proof; must nail activation."},
+    "Usage-based": {"note": "Metered by units/automation minutes. Aligns price to value."},
+    "Tiered": {"note": "Good/Better/Best features; segments by willingness-to-pay."},
+    "Freemium": {"note": "High top-of-funnel; conversion relies on aha+paywall."},
+    "Annual Contract": {"note": "Higher ACV and commitment; longer cycles and CAC."},
 }
 
 CHANNELS = {
-    # cost=avg CAC at steady state, ramp months (to reach 100%), ceiling=volume scaler, fit boosts by segment type
-    "Content/SEO":      {"cost": 70,  "ramp": 4, "ceiling": 0.7, "fit": {"b2b": 0.2, "b2c": 0.6}},
-    "Referral/Partner": {"cost": 55,  "ramp": 2, "ceiling": 0.8, "fit": {"b2b": 0.7, "b2c": 0.4}},
-    "Outbound/Email":   {"cost": 120, "ramp": 1, "ceiling": 0.5, "fit": {"b2b": 0.8, "b2c": 0.2}},
-    "Paid Social":      {"cost": 110, "ramp": 1, "ceiling": 1.0, "fit": {"b2b": 0.3, "b2c": 0.9}},
-    "Paid Search":      {"cost": 95,  "ramp": 1, "ceiling": 0.9, "fit": {"b2b": 0.5, "b2c": 0.7}},
-    "Events/Webinars":  {"cost": 180, "ramp": 2, "ceiling": 0.4, "fit": {"b2b": 0.8, "b2c": 0.2}},
-    "App Directory":    {"cost": 60,  "ramp": 2, "ceiling": 0.5, "fit": {"b2b": 0.4, "b2c": 0.6}},
+    "Content/SEO": {
+        "ramp": "slow",
+        "fit": {"homeowner": 0.9, "landlord": 0.7, "installer": 0.6},
+        "cac_mean": 35,
+        "cac_std": 10,
+        "ceiling": 0.35,  # share of volume before diminishing returns
+    },
+    "Referral/Partner": {
+        "ramp": "medium",
+        "fit": {"homeowner": 0.8, "landlord": 1.0, "installer": 1.1},
+        "cac_mean": 50,
+        "cac_std": 15,
+        "ceiling": 0.40,
+    },
+    "Outbound/Email": {
+        "ramp": "medium",
+        "fit": {"homeowner": 0.7, "landlord": 1.1, "installer": 1.0},
+        "cac_mean": 90,
+        "cac_std": 25,
+        "ceiling": 0.30,
+    },
+    "Paid Social/Search": {
+        "ramp": "fast",
+        "fit": {"homeowner": 1.1, "landlord": 0.8, "installer": 0.7},
+        "cac_mean": 120,
+        "cac_std": 35,
+        "ceiling": 0.50,
+    },
+    "Events/Webinars": {
+        "ramp": "slow",
+        "fit": {"homeowner": 0.6, "landlord": 1.1, "installer": 1.1},
+        "cac_mean": 140,
+        "cac_std": 40,
+        "ceiling": 0.25,
+    },
+    "App Directory/Marketplace": {
+        "ramp": "fast",
+        "fit": {"homeowner": 0.9, "landlord": 1.0, "installer": 1.0},
+        "cac_mean": 80,
+        "cac_std": 20,
+        "ceiling": 0.30,
+    },
 }
 
-ACRONYM_HELP = "ARPU = Average Revenue per Unit, CAC = Customer Acquisition Cost, LTV = Lifetime Value."
+RAMP_MULT = {"slow": 0.6, "medium": 0.8, "fast": 1.0}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# State
-# ──────────────────────────────────────────────────────────────────────────────
+# Random market events (stochastic, mild)
+MARKET_EVENTS = [
+    {"name": "Seasonality dip", "mult_visits": 0.90, "mult_cac": 1.05, "desc": "Lower inbound; ads a bit pricier."},
+    {"name": "Partner boost", "mult_visits": 1.12, "mult_cac": 0.95, "desc": "Referral spike; slightly cheaper CAC."},
+    {"name": "Ad inventory shock", "mult_visits": 1.00, "mult_cac": 1.15, "desc": "Ads cost more; similar traffic."},
+    {"name": "Rebate surge", "mult_visits": 1.08, "mult_cac": 0.92, "desc": "More interest from incentives."},
+    {"name": "No major shocks", "mult_visits": 1.00, "mult_cac": 1.00, "desc": "Steady state."},
+]
+
+# Scoring weights
+SCORES = {
+    "Model Coherence": 30,
+    "Unit Economics": 30,
+    "GTM Fit & Focus": 20,
+    "Iteration Quality": 10,
+    "Evidence Plan": 10,
+}
+
+# ======================================================================================
+# STATE
+# ======================================================================================
 def init_state():
-    st.session_state.s3 = {
-        "stage": "intro",
-        "segment": None,
-        "segment_secondary": None,
-        "value_outcome": VALUE_OUTCOMES[0],
-        "proof": [PROOF_ELEMENTS[0]],
-        "promise": PROMISE[1],
-        "delivery": "Hybrid",
-        "unit_value": UNIT_OF_VALUE[0],
-        "model": "Subscription",
-        "price_tier": {"Good": 79, "Better": 119, "Best": 149},
-        "paywall_note": "Core automation gated at paid tiers.",
-        "gtm_tokens": 12,
-        "dev_tokens": 4,
-        "gtm_alloc": {k: 0 for k in CHANNELS.keys()},
-        "history": {},  # quarter -> results dict
-        "cash": 200_000,  # starting cash
-        "notes_tests": {"t1": "", "t2": ""},
-        "score": None,
-        "coach": None,
+    ss = st.session_state
+    ss.setdefault("stage", "intro")
+    ss.setdefault("segment", None)
+    ss.setdefault("secondary_segment", None)
+
+    ss.setdefault("value_prop", {
+        "core_job": "",
+        "outcome": "",
+        "proof": "",
+        "promise": "Standard",
+    })
+    ss.setdefault("delivery", "Hybrid")
+    ss.setdefault("unit_value", "per home")
+    ss.setdefault("model", "Tiered")
+
+    # Pricing tiers, can be interpreted per selected unit
+    ss.setdefault("pricing", {"good": 9.0, "better": 15.0, "best": 25.0})
+    # Paywall strictness: 0 (generous) to 2 (strict)
+    ss.setdefault("paywall", 1)
+
+    # Channels → tokens (0..100 total recommended)
+    ss.setdefault("channels", {ch: 0 for ch in CHANNELS})
+    ss.setdefault("sales_led", False)  # toggle for B2B flavors
+
+    # Dev tokens (reduce COGS / TTV)
+    ss.setdefault("dev_tokens", {"onboarding": 0, "automation": 0})  # 0..10 each
+
+    # Results by quarter
+    ss.setdefault("quarters", {})  # "Q1": {...}, "Q2": {...}, ...
+    ss.setdefault("q_list", [])
+
+    # Decisions / notes
+    ss.setdefault("final", {"next1": "", "next2": ""})
+
+init_state()
+
+# ======================================================================================
+# HELPERS
+# ======================================================================================
+
+def stepper():
+    steps = [
+        "Intro",
+        "Segment",
+        "Value Prop",
+        "Pricing/Model",
+        "Channels",
+        "Run Q1",
+        "Adjust & Run Q2",
+        "Decide",
+        "Results",
+    ]
+    order = {
+        "intro": 0, "segment": 1, "value_prop": 2, "pricing": 3,
+        "channels": 4, "run_q1": 5, "adjust_q2": 6, "decide": 7, "results": 8
     }
+    active = order.get(st.session_state.stage, 0)
+    cols = st.columns(len(steps))
+    for i, c in enumerate(cols):
+        with c:
+            style = (
+                "background:#eef6ff;border:1px solid #cde;"
+                if i == active else "background:#f7f7f9;border:1px solid #eee;"
+            )
+            st.markdown(
+                f"<div style='{style};padding:8px 10px;border-radius:10px;text-align:center;min-height:52px'>{steps[i]}</div>",
+                unsafe_allow_html=True,
+            )
 
-if "s3" not in st.session_state:
-    init_state()
-S = st.session_state.s3
+def goto(stage: str):
+    st.session_state.stage = stage
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Utility
-# ──────────────────────────────────────────────────────────────────────────────
-def clamp(x, lo, hi): return max(lo, min(hi, x))
+def channel_allocation_summary(alloc: Dict[str, int]) -> Tuple[int, Dict[str, float]]:
+    total = sum(alloc.values())
+    if total <= 0:
+        return 0, {ch: 0.0 for ch in alloc}
+    mix = {ch: alloc[ch] / total for ch in alloc}
+    return total, mix
 
-def ramp_factor(ramp_months, quarter_index):
-    # Q1,Q2,Q3,Q4  -> fraction of maturity based on ramp
-    months = quarter_index * 3
-    return clamp(months / max(1, ramp_months * 3), 0.25, 1.0)
+def nudge(text: str, variant="info"):
+    if variant == "warn":
+        st.warning(text)
+    elif variant == "success":
+        st.success(text)
+    elif variant == "error":
+        st.error(text)
+    else:
+        st.info(text)
 
-def price_effect(price, base_ARPU, elasticity):
-    # <1 boosts conv; >1 hurts conv; symmetrical damped
-    ratio = price / base_ARPU
-    return clamp(math.exp(-elasticity * (ratio - 1.0)), 0.5, 1.2)
+# --------------------------------------------------------------------------------------
+# Cohort & economics simulation
+# --------------------------------------------------------------------------------------
+@dataclass
+class QuarterOutcome:
+    visits: int
+    trials: int
+    activations: int
+    paid: int
+    retained: int
+    arpu: float
+    gross_margin: float
+    cac_effective: float
+    ltv: float
+    ltv_cac: float
+    payback_months: float
+    churn: float
+    cogs_per_unit: float
+    sales_cycle_days: int
+    cash_burn: float
+    event: str
+    notes: List[str]
 
-def ttv_effect(ttv_days, sens):
-    # faster time-to-value improves activation/retention
-    return clamp(1.1 - sens * (ttv_days / 30.0) * 0.4, 0.7, 1.15)
+def simulate_quarter(
+    qname: str,
+    segment_key: str,
+    delivery: str,
+    model: str,
+    pricing: Dict[str, float],
+    paywall_strictness: int,
+    channels: Dict[str, int],
+    sales_led: bool,
+    dev_tokens: Dict[str, int],
+    prev_q: QuarterOutcome | None = None,
+) -> QuarterOutcome:
+    seg = SEGMENTS[segment_key]
+    base = seg["base_conv"]
+    # Visits scaling from channels
+    total_tokens, mix = channel_allocation_summary(channels)
+    # If nothing allocated, give a minimal trickle (to avoid divide-by-zero)
+    base_traffic = 10000 if total_tokens > 0 else 800
 
-def model_paywall_effect(model, paywall_friction, b2b):
-    # Freemium high signup/low convert; Contracts better convert but slow
-    if model == "Freemium":
-        return 1.2, clamp(1.0 - 0.3 * paywall_friction, 0.6, 0.95), 0.9
-    if model == "Contracts":
-        return 0.8, 1.1 if b2b else 0.9, 0.85
-    if model == "Usage-based":
-        return 1.0, 1.05, 1.0
-    if model == "One-time Purchase":
-        return 0.9, 0.95, 1.05
-    if model == "Tiered Access":
-        return 1.0, 1.0, 1.0
-    return 1.0, 1.0, 1.0  # Subscription default
-
-def channel_volume_and_cac(seg_key, quarter_idx) -> (float, float, Dict[str, Dict[str, float]]):
-    seg = SEGMENTS[seg_key]
-    b2b = seg["b2b"]
-    details = {}
-    total_visits = 0.0
-    weighted_cac_cost = 0.0
-    for ch, tokens in S["gtm_alloc"].items():
-        if tokens <= 0: 
+    # Channel ramp (we apply ramp-weighted visits and CAC)
+    visit_multiplier = 0.0
+    cac_components = []
+    for ch, share in mix.items():
+        if share <= 0:
             continue
-        p = CHANNELS[ch]
-        fit = p["fit"]["b2b" if b2b else "b2c"]
-        maturity = ramp_factor(p["ramp"], quarter_idx)
-        diminishing = clamp(1 - 0.06 * max(0, tokens - 4), 0.6, 1.0)
-        volume = tokens * p["ceiling"] * fit * maturity * diminishing * 250 * seg["size_index"]
-        cac = p["cost"] / clamp(0.7 + 0.06 * tokens, 0.8, 1.3)  # a bit better with more tokens, up to a point
-        total_visits += volume
-        weighted_cac_cost += cac * volume
-        details[ch] = {"visits": volume, "cac": cac, "maturity": maturity}
-    avg_cac = (weighted_cac_cost / total_visits) if total_visits > 0 else 0
-    return total_visits, avg_cac, details
+        ch_def = CHANNELS[ch]
+        # diminishing returns after ceiling:
+        ceiling = ch_def["ceiling"]
+        dim = 1.0 if share <= ceiling else max(0.6, 1.0 - (share - ceiling) * 1.25)
+        ramp = RAMP_MULT[ch_def["ramp"]]
+        fit = ch_def["fit"][segment_key]
+        ch_visits = base_traffic * share * ramp * fit * dim
+        visit_multiplier += ch_visits / base_traffic
+        # CAC samples
+        sample_cac = np.random.normal(ch_def["cac_mean"], ch_def["cac_std"])
+        sample_cac = max(20, float(sample_cac * (1.0 / fit) * (1.0 / ramp)))  # better fit & ramp => lower CAC
+        cac_components.append(sample_cac * share)
 
-def quarterly_events(q):
-    events = []
-    mul = 1.0
-    # Simple seasonality: Q3 dip, Q1 slight rise for consumer; B2B steady except Q4 slows
-    if q == 3:
-        events.append("Seasonality dip (summer attendance)"); mul *= 0.92
-    if q == 1:
-        events.append("New year bump"); mul *= 1.06
-    # Random:
-    roll = random.random()
-    if roll < 0.15:
-        events.append("Partner boost"); mul *= 1.08
-    elif roll < 0.30:
-        events.append("Ad inventory shock"); mul *= 0.93
-    return mul, events
+    # Market event
+    ev = random.choice(MARKET_EVENTS)
+    event_vis_mult = ev["mult_visits"]
+    event_cac_mult = ev["mult_cac"]
 
-def simulate_quarter(q_index: int, seg_key: str, price_choice: int, delivery_key: str, model_key: str) -> Dict[str, Any]:
-    seg = SEGMENTS[seg_key]
-    b2b = seg["b2b"]
-    # price selection (Good/Better/Best)
-    tier_price = [S["price_tier"]["Good"], S["price_tier"]["Better"], S["price_tier"]["Best"]][price_choice]
-    # Effects
-    price_fx = price_effect(tier_price, seg["base_ARPU"], seg["price_elasticity"])
-    ttv_fx = ttv_effect(DELIVERY[delivery_key]["ttv_days"], seg["ttv_sensitivity"])
-    signup_fx, convert_fx, cycle_fx = model_paywall_effect(model_key, seg["paywall_friction"], b2b)
-    # Channels
-    visits, avg_cac, channel_detail = channel_volume_and_cac(seg_key, q_index)
-    season_mul, events = quarterly_events(q_index)
+    visits = int(base_traffic * max(0.2, visit_multiplier) * event_vis_mult)
 
-    # Funnel baseline
-    visit_to_trial = 0.06 * signup_fx * season_mul
-    trial_to_activation = 0.33 * ttv_fx * season_mul
-    activation_to_paid = 0.45 * convert_fx * season_mul
-    if model_key == "Freemium":
-        visit_to_trial *= 1.3
-        activation_to_paid *= 0.55
-    if model_key == "Contracts" and b2b:
-        activation_to_paid *= 1.15
-        avg_cac *= 1.3  # sales-led effect
-    # Conversions shaped by price
-    activation_to_paid *= clamp(0.7 + 0.4*(price_fx-0.8), 0.5, 1.2)
+    # Paywall & elasticity effects
+    # Delivery impacts time-to-value & COGS
+    dlv = DELIVERY_LEVELS[delivery]
+    ttv_days = dlv["ttv_days"] - dev_tokens.get("onboarding", 0) * 0.3
+    ttv_days = max(0.7, ttv_days)
+    cogs_mult = dlv["cogs_mult"] - dev_tokens.get("automation", 0) * 0.02
+    cogs_mult = max(0.45, cogs_mult)
 
-    trials = visits * visit_to_trial
-    activations = trials * trial_to_activation
-    new_paid = activations * activation_to_paid
+    # Price anchor → choose middle tier as central ARPU anchor
+    price_point = max(pricing.get("better", 0.0), 0.0)
+    # Segment ARPU base adjusted by price elasticity
+    arpu = seg["arpu_base"] * (price_point / max(1.0, seg["arpu_base"])) ** (1.0 / seg["price_elasticity"])
+    # Freemium or tiered may alter ARPU slightly (simple rules)
+    if model == "Freemium":
+        arpu *= 0.85  # more free usage → lower early ARPU
+    elif model == "Annual Contract" and seg["sales_led_benefit"]:
+        arpu *= 1.15  # bigger ACV/ARPU for B2B under annuals
 
-    # Revenue & COGS (per unit)
-    cogs_pct = DELIVERY[delivery_key]["COGS_pct"]
-    arpu = tier_price if model_key != "Usage-based" else max(49, tier_price*0.8 + 30)
-    gross_margin = clamp(1 - cogs_pct, 0.3, 0.9)
+    # Funnel
+    v2t = base["visit_to_trial"]
+    t2a = base["trial_to_activation"]
+    a2p = base["activation_to_paid"]
+    # Apply paywall friction (strictness 0..2)
+    paywall_fric = seg["paywall_friction"] * (1.0 + 0.08 * (paywall_strictness - 1))
+    t2a_adj = max(0.05, t2a / paywall_fric)
 
-    # Churn (monthly) → convert to quarter
-    monthly_churn = seg["churn_base"] * (1.05 - 0.1*ttv_fx) * (1.02 + 0.06*(price_fx < 0.9))
-    q_churn = 1 - (1 - monthly_churn)**3
+    # Sales-led boosts activation & paid for B2B; slows cycle
+    sales_cycle_days = 7
+    if sales_led and seg["sales_led_benefit"]:
+        t2a_adj *= 1.08
+        a2p *= 1.12
+        sales_cycle_days = 18
 
-    # Existing base carries over from prior quarter
-    prev_paid = S["history"].get(q_index-1, {}).get("ending_paid", 0)
-    churned = prev_paid * q_churn
-    ending_paid = prev_paid - churned + new_paid
+    # Time-to-value effect on activation
+    ttv_effect = max(0.8, 1.2 - 0.05 * ttv_days)  # faster TTV => >1.0 multiplier
+    t2a_adj *= ttv_effect
 
-    # Economics
-    revenue = ending_paid * arpu * 3  # per quarter
-    cogs = revenue * (1 - gross_margin)
-    # CAC spend approx = new_paid * avg_cac (guard div-by-zero)
-    cac_spend = new_paid * avg_cac
-    # Simple OPEX from channels (+ dev tokens amortized)
-    opex = 30_000 + sum(S["gtm_alloc"].values())*2_000 + (max(0, 4 - S["dev_tokens"]))*1_500
-    cash_delta = revenue - (cogs + cac_spend + opex)
-    cash_end = S["cash"] + cash_delta
+    trials = int(visits * v2t)
+    activations = int(trials * t2a_adj)
+    paid = int(activations * a2p)
 
-    # KPI
-    payback_months = (avg_cac / max(1, arpu * gross_margin)) if new_paid > 0 else float("inf")
-    ltv = (arpu * gross_margin) / max(1e-6, monthly_churn)
-    ltv_cac = (ltv / avg_cac) if avg_cac > 0 else float("inf")
+    # Retention month-1 and churn
+    # Baseline churn = 1 - retention_month_1
+    base_ret = base["retention_month_1"]
+    churn = 1.0 - base_ret
 
-    # Warnings (nudges)
-    nudges = []
-    if payback_months > (15 if b2b else 9):
-        nudges.append("Payback too long — consider lowering CAC (channel mix) or raising price/value.")
-    if model_key == "Freemium" and activation_to_paid < 0.02:
-        nudges.append("Freemium conversion very low — paywall may be too generous.")
+    # Adjust churn for time-to-value & price
+    churn *= seg["churn_sensitivity"]["time_to_value"] ** max(0, (ttv_days - 2.0) / 3.0)
+    churn *= seg["churn_sensitivity"]["price"] ** max(0, (price_point - seg["arpu_base"]) / 10.0)
+
+    # Sales-led retention lift
+    if sales_led and seg["sales_led_benefit"]:
+        churn *= 0.94
+
+    churn = min(max(churn, 0.02), 0.25)
+    retained = int(paid * (1.0 - churn))
+
+    # COGS per paid unit
+    # For Hardware+Subscription, assume initial device costs amortized; keep it simple:
+    base_cogs = 4.5  # $/paid-unit-month baseline
+    if model == "Hardware + Subscription":
+        base_cogs += 2.2
+    cogs_per_unit = base_cogs * cogs_mult
+
+    # CAC (effective): mix-weighted with event multiplier, plus sales-led overhead
+    if cac_components:
+        cac_raw = sum(cac_components) / sum(mix.values())
+    else:
+        cac_raw = 120.0
+    if sales_led and seg["sales_led_benefit"]:
+        cac_raw *= 1.25
+    cac_effective = cac_raw * event_cac_mult
+
+    # LTV & payback
+    # LTV (very simplified): ARPU * (1/churn) * gross margin
+    # Gross margin per paid unit:
+    gross_margin = max(0.10, (arpu - cogs_per_unit) / max(0.01, arpu))
+    ltv = max(0.0, (arpu * (1.0 / max(churn, 0.02))) * gross_margin)
+    ltv_cac = ltv / max(1.0, cac_effective)
+    payback_months = max(1.0, cac_effective / max(0.01, (arpu * gross_margin)))
+
+    # Cash burn (toy model): CAC spend for new paid users + fixed ops – gross profit
+    fixed_ops = 25000 if sales_led else 16000
+    cac_spend = paid * cac_effective
+    gross_profit = max(0.0, (arpu - cogs_per_unit) * paid)
+    cash_burn = max(0.0, fixed_ops + cac_spend - gross_profit)
+
+    # Notes / nudges
+    notes = []
+    if payback_months > (9 if segment_key == "homeowner" else 15):
+        notes.append("Payback is high for this segment. Consider higher price, better conversion, or lower CAC.")
+    if model == "Freemium" and (paid / max(1, activations)) < 0.02:
+        notes.append("Freemium conversion is low (<2%). Paywall too generous or aha too late?")
     if gross_margin < 0.60:
-        nudges.append("COGS high for price — consider Hybrid/Automated delivery or higher pricing.")
-    if sum(S["gtm_alloc"].values()) and max(S["gtm_alloc"].values()) > 0.6 * sum(S["gtm_alloc"].values()):
-        nudges.append("GTM heavily concentrated — reduce reliance on a single channel.")
-
-    result = dict(
-        q=q_index,
-        visits=int(visits),
-        trials=int(trials),
-        activations=int(activations),
-        new_paid=int(new_paid),
-        ending_paid=int(ending_paid),
+        notes.append("Gross margin below 60%. Consider hybrid/automation or raise price.")
+    return QuarterOutcome(
+        visits=visits,
+        trials=trials,
+        activations=activations,
+        paid=paid,
+        retained=retained,
         arpu=round(arpu, 2),
         gross_margin=round(gross_margin, 2),
-        churn_q=round(q_churn, 3),
-        avg_cac=round(avg_cac, 2),
-        ltv=round(ltv, 2) if math.isfinite(ltv) else float("inf"),
-        ltv_cac=round(ltv_cac, 2) if math.isfinite(ltv_cac) else float("inf"),
-        payback_m=round(payback_months, 1) if math.isfinite(payback_months) else float("inf"),
-        revenue=int(revenue),
-        cogs=int(cogs),
-        cac_spend=int(cac_spend),
-        opex=int(opex),
-        cash_delta=int(cash_delta),
-        cash_end=int(cash_end),
-        events=events,
-        nudges=nudges,
-        channel_detail=channel_detail,
-        b2b=b2b
-    )
-    return result
-
-def score_run(history: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
-    # Coherence: model vs segment vs delivery vs channels (quick heuristics)
-    seg = SEGMENTS[S["segment"]]
-    b2b = seg["b2b"]
-    channels_used = {k: v for k, v in S["gtm_alloc"].items() if v > 0}
-    total_alloc = sum(channels_used.values()) if channels_used else 0
-    big_channel = max(channels_used.values()) if channels_used else 0
-
-    # simple alignment heuristic: B2B likes Outbound/Events; B2C likes Paid Social/Search
-    b2b_fit = (
-        (channels_used.get("Outbound/Email", 0) + channels_used.get("Events/Webinars", 0)) >= 4
-        if b2b
-        else (channels_used.get("Paid Social", 0) + channels_used.get("Paid Search", 0)) >= 4
-    )
-    delivery_ok = DELIVERY[S["delivery"]]["COGS_pct"] <= 0.4 or (S["price_tier"]["Better"] >= 119)
-
-    concentration_high = total_alloc > 0 and big_channel > 0.6 * total_alloc
-    coherence = clamp(
-        0.5 + 0.2 * (1 if b2b_fit else 0) + 0.3 * (1 if delivery_ok else 0) - 0.1 * (1 if concentration_high else 0),
-        0, 1
+        cac_effective=round(cac_effective, 2),
+        ltv=round(ltv, 2),
+        ltv_cac=round(ltv_cac, 2),
+        payback_months=round(payback_months, 1),
+        churn=round(churn, 3),
+        cogs_per_unit=round(cogs_per_unit, 2),
+        sales_cycle_days=sales_cycle_days,
+        cash_burn=round(cash_burn, 2),
+        event=f"{ev['name']} — {ev['desc']}",
+        notes=notes,
     )
 
-    # Unit economics from last quarter (prefer Q4)
-    last_q = max(history.keys()) if history else 1
-    last = history[last_q]
-    econ_ok = (
-        (last["ltv_cac"] >= 3.0)
-        and (last["gross_margin"] >= 0.60)
-        and (last["payback_m"] <= (15 if b2b else 9))
-    )
-    unit_econ = clamp(0.3 + 0.5 * (last["ltv_cac"] / 4) + 0.2 * (1 if econ_ok else 0), 0, 1)
+# --------------------------------------------------------------------------------------
+# Scoring & feedback
+# --------------------------------------------------------------------------------------
+def score_sim(qs: Dict[str, QuarterOutcome]) -> Tuple[int, Dict[str, int], Dict[str, str]]:
+    weights = SCORES.copy()
+    # Model Coherence (30): alignment of delivery, pricing, channels with segment
+    coh = 0
+    seg = st.session_state.segment
+    deliv = st.session_state.delivery
+    model = st.session_state.model
+    channels = st.session_state.channels
+    _, mix = channel_allocation_summary(channels)
 
-    # GTM fit & focus
-    focus_penalty = 0.2 if concentration_high else 0.0
-    gtm_fit = clamp(0.7 - focus_penalty, 0, 1)
+    # Coherence heuristics:
+    if seg == "homeowner":
+        # self-serve: prefer Automated/Hybrid, Paid Social/Search + Content
+        if deliv in ("Hybrid", "Automated"):
+            coh += 10
+        if mix.get("Paid Social/Search", 0) >= 0.25:
+            coh += 8
+        if mix.get("Content/SEO", 0) >= 0.15:
+            coh += 6
+        if model in ("Tiered", "Freemium", "Subscription only"):
+            coh += 6
+    elif seg in ("landlord", "installer"):
+        # B2B: sales-led OK; Referral/Partner, Outbound, Events strong
+        if deliv in ("Hybrid", "Automated"):
+            coh += 8
+        if st.session_state.sales_led:
+            coh += 8
+        if mix.get("Referral/Partner", 0) >= 0.20:
+            coh += 6
+        if mix.get("Outbound/Email", 0) >= 0.15 or mix.get("Events/Webinars", 0) >= 0.15:
+            coh += 4
+        if model in ("Hardware + Subscription", "Annual Contract", "Tiered"):
+            coh += 4
+    coh = min(weights["Model Coherence"], coh)
 
-    # Iteration quality: Q2 vs Q1 deltas
-    iter_score = 0.5
-    if 1 in history and 2 in history:
-        if history[2]["payback_m"] < history[1]["payback_m"]:
-            iter_score += 0.15
-        if history[2]["ltv_cac"] > history[1]["ltv_cac"]:
-            iter_score += 0.15
-        if history[2]["ending_paid"] > history[1]["ending_paid"]:
-            iter_score += 0.1
-    iter_score = clamp(iter_score, 0, 1)
+    # Unit Economics (30): from Q2 if available else Q1
+    last = qs.get("Q2", qs.get("Q1"))
+    econ = 0
+    if last:
+        if last.ltv_cac >= 3.0:
+            econ += 12
+        elif last.ltv_cac >= 2.0:
+            econ += 8
+        else:
+            econ += 4
 
-    # Evidence plan
-    t1, t2 = S["notes_tests"]["t1"], S["notes_tests"]["t2"]
+        if last.gross_margin >= 0.60:
+            econ += 8
+        elif last.gross_margin >= 0.50:
+            econ += 5
+        else:
+            econ += 2
 
-    def is_specific(s: str) -> bool:
-        s = (s or "").lower()
-        return any(x in s for x in ["target", "%", "pp", ">=", "<=", " by "]) and len(s.strip()) > 8
+        threshold = 9 if st.session_state.segment == "homeowner" else 15
+        if last.payback_months <= threshold:
+            econ += 6
+        elif last.payback_months <= threshold + 4:
+            econ += 4
+        else:
+            econ += 2
 
-    evidence = clamp(0.4 + 0.3 * is_specific(t1) + 0.3 * is_specific(t2), 0, 1)
+        # churn band
+        if last.churn <= 0.06:
+            econ += 4
+        elif last.churn <= 0.10:
+            econ += 2
+    econ = min(weights["Unit Economics"], econ)
 
-    total = round(100 * (0.30 * coherence + 0.30 * unit_econ + 0.20 * gtm_fit + 0.10 * iter_score + 0.10 * evidence))
+    # GTM Fit & Focus (20): segment-fit and no channel >60% by Q2
+    gtm = 0
+    # segment-fit: sum of (mix * fit)
+    fit_score = 0.0
+    for ch, share in mix.items():
+        fit_score += share * CHANNELS[ch]["fit"][st.session_state.segment]
+    if fit_score >= 0.95:
+        gtm += 10
+    elif fit_score >= 0.80:
+        gtm += 7
+    else:
+        gtm += 4
+    # concentration
+    if mix:
+        max_share = max(mix.values())
+        if max_share <= 0.60:
+            gtm += 10
+        elif max_share <= 0.75:
+            gtm += 6
+        else:
+            gtm += 3
+    gtm = min(weights["GTM Fit & Focus"], gtm)
 
-    # Explanations (no backslash-escaped quotes)
+    # Iteration Quality (10): Q2 improves Q1 on binding constraint (payback or LTV/CAC or churn)
+    it = 0
+    if "Q1" in qs and "Q2" in qs:
+        q1, q2 = qs["Q1"], qs["Q2"]
+        gains = 0
+        if q2.payback_months < q1.payback_months:
+            gains += 1
+        if q2.ltv_cac > q1.ltv_cac:
+            gains += 1
+        if q2.churn < q1.churn:
+            gains += 1
+        if q2.gross_margin > q1.gross_margin:
+            gains += 1
+        it = [0, 4, 7, 9, 10][min(gains, 4)]
+    it = min(weights["Iteration Quality"], it)
+
+    # Evidence Plan (10): presence & specificity of next tests
+    ev = 0
+    n1 = st.session_state.final.get("next1", "").strip()
+    n2 = st.session_state.final.get("next2", "").strip()
+    if n1 and n2:
+        ev += 6
+        # crude specificity test: look for a number or %
+        for n in (n1, n2):
+            if any(ch in n for ch in ["%", "≥", ">", "<", "pp", "target"]):
+                ev += 2
+    elif n1 or n2:
+        ev += 3
+    ev = min(weights["Evidence Plan"], ev)
+
+    breakdown = {
+        "Model Coherence": coh,
+        "Unit Economics": econ,
+        "GTM Fit & Focus": gtm,
+        "Iteration Quality": it,
+        "Evidence Plan": ev,
+    }
+    total = sum(breakdown.values())
+    # Reasons
     reasons = {
-        "Model Coherence": (
-            ("Excellent" if coherence >= 0.8 else "Good" if coherence >= 0.6 else "Needs work")
-            + f" — Segment {'B2B' if b2b else 'B2C'} with channels "
-            + ("well aligned" if b2b_fit else "partly aligned")
-            + f"; delivery {'supports' if delivery_ok else 'pressures'} margin; "
-            + f"concentration={'high' if concentration_high else 'balanced'}."
-        ),
-        "Unit Economics": (
-            ("Excellent" if unit_econ >= 0.8 else "Good" if unit_econ >= 0.6 else "Needs work")
-            + f" — LTV/CAC={last['ltv_cac']}, GM={int(last['gross_margin']*100)}%, "
-            + f"Payback={last['payback_m']} mo."
-        ),
-        "GTM Fit & Focus": (
-            ("Excellent" if gtm_fit >= 0.8 else "Good" if gtm_fit >= 0.6 else "Needs work")
-            + ("" if not concentration_high else " — Heavy reliance on one channel (>60%) by Q2.")
-        ),
-        "Iteration Quality": (
-            ("Excellent" if iter_score >= 0.8 else "Good" if iter_score >= 0.6 else "Needs work")
-            + (
-                " — Q2 improved payback/LTV/CAC vs Q1."
-                if (1 in history and 2 in history and
-                    (history[2]['payback_m'] < history[1]['payback_m'] or
-                     history[2]['ltv_cac'] > history[1]['ltv_cac']))
-                else " — Limited measurable improvement."
+        "Model Coherence": "Delivery, pricing model, and channels align with the chosen segment.",
+        "Unit Economics": "Assessed LTV/CAC, gross margin, churn band, and payback vs. segment targets.",
+        "GTM Fit & Focus": "Evaluated channel/segment fit and concentration (no single channel >60%).",
+        "Iteration Quality": "Checked Q2 vs Q1 improvements on payback, LTV/CAC, churn, and margin.",
+        "Evidence Plan": "Credited presence/specificity of two next tests with clear targets.",
+    }
+    return total, breakdown, reasons
+
+# ======================================================================================
+# SCREENS
+# ======================================================================================
+
+def screen_intro():
+    stepper()
+    st.title("Simulation #3 — Business Model Fit (ThermaLoop)")
+    st.write(
+        "Translate your early validation into a coherent business model.\n"
+        "You’ll choose a segment, craft a value prop, pick a revenue model and pricing, "
+        "allocate GTM channels, simulate Q1–Q2, iterate, and see your score."
+    )
+    st.markdown("**You will:**")
+    st.markdown(
+        "- Choose **ICP (segment)** and optional secondary\n"
+        "- Build a **value proposition** and **delivery level** (Manual/Hybrid/Automated)\n"
+        "- Select **pricing/revenue model** and **paywall strictness**\n"
+        "- Allocate **GTM tokens** across channels + optional **Dev tokens**\n"
+        "- **Run Q1**, adjust, **Run Q2**, then finalize decisions and get feedback"
+    )
+    if st.button("Start Simulation", type="primary"):
+        goto("segment")
+
+def screen_segment():
+    stepper()
+    st.header("1) Choose Segment")
+    c1, c2 = st.columns([0.6, 0.4])
+    with c1:
+        st.radio(
+            "Primary ICP / beachhead:",
+            ["homeowner", "landlord", "installer"],
+            index=["homeowner", "landlord", "installer"].index(st.session_state.segment) if st.session_state.segment else 0,
+            key="segment",
+            format_func=lambda k: SEGMENTS[k]["name"],
+        )
+        st.checkbox("Add secondary segment (optional)", key="add_sec")
+        if st.session_state.get("add_sec"):
+            st.selectbox(
+                "Secondary (optional):",
+                ["—", "homeowner", "landlord", "installer"],
+                index=0,
+                key="secondary_segment",
+                format_func=lambda k: "None" if k == "—" else SEGMENTS[k]["name"],
             )
-        ),
-        "Evidence Plan": (
-            ("Excellent" if evidence >= 0.8 else "Good" if evidence >= 0.6 else "Needs work")
-            + (" — Both tests include targets." if (is_specific(t1) and is_specific(t2)) else " — Add clear targets/thresholds.")
-        ),
+    with c2:
+        st.markdown("**Baseline funnel (per segment)**")
+        seg = SEGMENTS[st.session_state.segment]
+        base = seg["base_conv"]
+        df = pd.DataFrame(
+            {
+                "Stage": ["Visit→Trial", "Trial→Activation", "Activation→Paid", "Retention M1"],
+                "Rate": [
+                    f"{int(base['visit_to_trial']*100)}%",
+                    f"{int(base['trial_to_activation']*100)}%",
+                    f"{int(base['activation_to_paid']*100)}%",
+                    f"{int(base['retention_month_1']*100)}%",
+                ],
+            }
+        )
+        st.dataframe(df, hide_index=True, use_container_width=True)
+        st.caption("These are baseline tendencies; your choices will shift these.")
+
+    st.divider()
+    st.button("Next: Value Proposition", type="primary", on_click=lambda: goto("value_prop"))
+
+def screen_value_prop():
+    stepper()
+    st.header("2) Value Proposition & Delivery")
+    c1, c2, c3 = st.columns([0.45, 0.30, 0.25])
+    with c1:
+        st.text_input("Core Job (what you help them do)", key="vp_core_job", value=st.session_state.value_prop["core_job"])
+        st.text_input("Key Outcome (metric they care about)", key="vp_outcome", value=st.session_state.value_prop["outcome"])
+        st.text_input("Proof Element (pilot, quote, rebate)", key="vp_proof", value=st.session_state.value_prop["proof"])
+        st.selectbox("Promise strength", ["Conservative", "Standard", "Bold"], key="vp_promise", index=["Conservative", "Standard", "Bold"].index(st.session_state.value_prop["promise"]))
+    with c2:
+        st.selectbox("Delivery level", list(DELIVERY_LEVELS.keys()), key="delivery", index=list(DELIVERY_LEVELS.keys()).index(st.session_state.delivery))
+        st.selectbox("Unit of value", UNIT_OF_VALUE, key="unit_value", index=UNIT_OF_VALUE.index(st.session_state.unit_value))
+        st.checkbox("Sales-led motion (applies best to B2B)", key="sales_led", value=st.session_state.sales_led)
+    with c3:
+        st.markdown("**Delivery impact**")
+        d = DELIVERY_LEVELS[st.session_state.delivery]
+        st.write(f"- COGS multiplier: **×{d['cogs_mult']}**")
+        st.write(f"- Time-to-Value: **~{d['ttv_days']} days**")
+        st.write(f"- Support load: **{d['support']}**")
+
+    # persist
+    st.session_state.value_prop = {
+        "core_job": st.session_state.vp_core_job,
+        "outcome": st.session_state.vp_outcome,
+        "proof": st.session_state.vp_proof,
+        "promise": st.session_state.vp_promise,
     }
 
-    score = {
-        "total": total,
-        "components": {
-            "Model Coherence": round(coherence, 2),
-            "Unit Economics": round(unit_econ, 2),
-            "GTM Fit & Focus": round(gtm_fit, 2),
-            "Iteration Quality": round(iter_score, 2),
-            "Evidence Plan": round(evidence, 2),
-        },
-        "reasons": reasons,
-    }
-    return score
+    st.divider()
+    st.button("Next: Pricing & Model", type="primary", on_click=lambda: goto("pricing"))
 
-# ──────────────────────────────────────────────────────────────────────────────
-# UI Blocks
-# ──────────────────────────────────────────────────────────────────────────────
-def header():
-    st.title(TITLE)
-    st.caption(SUB)
+def screen_pricing():
+    stepper()
+    st.header("3) Revenue Model & Pricing")
+    c1, c2 = st.columns([0.55, 0.45])
+    with c1:
+        st.selectbox("Business model", list(MODELS.keys()), key="model", index=list(MODELS.keys()).index(st.session_state.model))
+        st.caption(MODELS[st.session_state.model]["note"])
+        st.slider("Paywall strictness (0 = generous, 2 = strict)", 0, 2, key="paywall", value=st.session_state.paywall)
+        st.markdown("#### Price anchors (monthly)")
+        st.number_input("Good", min_value=0.0, value=float(st.session_state.pricing["good"]), key="p_good", format="%.2f")
+        st.number_input("Better", min_value=0.0, value=float(st.session_state.pricing["better"]), key="p_better", format="%.2f")
+        st.number_input("Best", min_value=0.0, value=float(st.session_state.pricing["best"]), key="p_best", format="%.2f")
+        st.caption("The **Better** tier is used as the central ARPU anchor in the model.")
+    with c2:
+        st.markdown("**Freemium gravity**")
+        st.write("- High top-of-funnel; lower early ARPU. Conversion depends on paywall and time-to-value.")
+        st.markdown("**Annual contracts**")
+        st.write("- Higher ACV + retention in B2B; slower cycles and higher CAC.")
 
-def page_intro():
-    st.markdown(f"**Market Brief:** {MARKET_BRIEF}")
-    st.markdown("""
-**What you'll do (60–90 min):**  
-1) Pick a **segment**, 2) assemble a **value proposition & delivery**,  
-3) choose a **revenue model & pricing**, 4) allocate **go-to-market (GTM) tokens** (+ optional **Dev tokens**),  
-5) **run quarters** to see funnel & financials, 6) **adjust** and run again,  
-7) capture your **Business Model Snapshot** + **next two tests**.
-""")
-    if st.button("Start"):
-        S["stage"] = "segment"; st.rerun()
+    # persist
+    st.session_state.pricing = {"good": st.session_state.p_good, "better": st.session_state.p_better, "best": st.session_state.p_best}
 
-def page_segment():
-    st.subheader("Segment focus")
-    st.write("Choose a primary segment and optional secondary (ICP vs beachhead).")
+    st.divider()
+    st.button("Next: Channels", type="primary", on_click=lambda: goto("channels"))
+
+def screen_channels():
+    stepper()
+    st.header("4) Channels & GTM Allocation")
+    st.caption("Allocate GTM tokens across channels (suggested total ≈ 100). Diminishing returns apply after each channel’s ceiling.")
+    cols = st.columns(3)
+    keys = list(CHANNELS.keys())
+    for i, ch in enumerate(keys):
+        with cols[i % 3]:
+            st.slider(ch, 0, 100, key=f"ch_{i}", value=st.session_state.channels[ch])
+
+    # persist channels from sliders
+    for i, ch in enumerate(keys):
+        st.session_state.channels[ch] = st.session_state.get(f"ch_{i}", 0)
+
+    total, mix = channel_allocation_summary(st.session_state.channels)
+    st.write(f"**Total GTM tokens:** {total}")
+    if total == 0:
+        nudge("You have 0 tokens allocated — you will get only a trickle of traffic.", "warn")
+
+    st.markdown("#### Optional: Dev tokens")
     c1, c2 = st.columns(2)
     with c1:
-        S["segment"] = st.selectbox("Primary segment", list(SEGMENTS.keys()), index=0)
+        st.slider("Onboarding polish (reduces TTV)", 0, 10, key="dev_onboarding", value=st.session_state.dev_tokens["onboarding"])
     with c2:
-        S["segment_secondary"] = st.selectbox("Secondary (optional)", ["—"] + list(SEGMENTS.keys()), index=0)
+        st.slider("Automation investment (reduces COGS)", 0, 10, key="dev_automation", value=st.session_state.dev_tokens["automation"])
+    st.session_state.dev_tokens = {"onboarding": st.session_state.dev_onboarding, "automation": st.session_state.dev_automation}
 
-    seg = SEGMENTS[S["segment"]]
-    with st.expander("Baseline profile & funnel assumptions"):
-        st.write(f"- **ARPU anchor:** ${seg['base_ARPU']}  \n- **Price elasticity:** {seg['price_elasticity']}  \n"
-                 f"- **Paywall friction:** {seg['paywall_friction']}  \n- **Time-to-value sensitivity:** {seg['ttv_sensitivity']}  \n"
-                 f"- **Churn base (monthly):** {seg['churn_base']:.3f}  \n- **B2B:** {seg['b2b']}")
+    st.divider()
+    st.button("Run Quarter 1", type="primary", on_click=lambda: goto("run_q1"))
 
-    if st.button("Next: Value Prop & Offer"):
-        S["stage"] = "value"; st.rerun()
+def screen_run_q1():
+    stepper()
+    st.header("5) Run Quarter 1")
+    if st.button("Simulate Q1", type="primary"):
+        q1 = simulate_quarter(
+            "Q1",
+            st.session_state.segment,
+            st.session_state.delivery,
+            st.session_state.model,
+            st.session_state.pricing,
+            st.session_state.paywall,
+            st.session_state.channels,
+            st.session_state.sales_led,
+            st.session_state.dev_tokens,
+            None,
+        )
+        st.session_state.quarters["Q1"] = q1
+        if "Q1" not in st.session_state.q_list:
+            st.session_state.q_list.append("Q1")
+        goto("adjust_q2")
 
-def page_value():
-    st.subheader("Value Prop & Offer Sketch")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        S["value_outcome"] = st.selectbox("Core outcome", VALUE_OUTCOMES, index=0)
-        S["promise"] = st.selectbox("Promise strength", PROMISE, index=1)
-    with c2:
-        S["proof"] = st.multiselect("Proof elements", PROOF_ELEMENTS, default=[PROOF_ELEMENTS[0]])
-        S["unit_value"] = st.selectbox("Unit of value", UNIT_OF_VALUE, index=0)
-    with c3:
-        S["delivery"] = st.selectbox("Delivery level", list(DELIVERY.keys()), index=1)
-        st.caption(f"COGS≈{int(DELIVERY[S['delivery']]['COGS_pct']*100)}%, Time-to-value≈{DELIVERY[S['delivery']]['ttv_days']} days")
+    st.caption("We’ll compute funnel, ARPU, churn, CAC, LTV/CAC, payback, gross margin, and cash burn with a mild market event.")
 
-    if st.button("Next: Pricing & Model"):
-        S["stage"] = "pricing"; st.rerun()
-
-def page_pricing():
-    st.subheader("Revenue model & price point")
-    S["model"] = st.selectbox("Revenue model", list(REVENUE_MODELS.keys()), index=0,
-                              help="Subscription, One-time Purchase, Usage-based, Freemium, Tiered Access, Contracts")
-    cols = st.columns(3)
-    S["price_tier"]["Good"] = cols[0].number_input("Good $", min_value=19, max_value=499, value=S["price_tier"]["Good"], step=5)
-    S["price_tier"]["Better"] = cols[1].number_input("Better $", min_value=19, max_value=799, value=S["price_tier"]["Better"], step=5)
-    S["price_tier"]["Best"] = cols[2].number_input("Best $", min_value=19, max_value=999, value=S["price_tier"]["Best"], step=5)
-
-    S["paywall_note"] = st.text_input("Paywall note (what’s paid vs free)", value=S["paywall_note"])
-    st.info("The sim computes COGS, gross margin, and payback, and applies price sensitivity based on your chosen segment.")
-
-    if st.button("Next: Channels & GTM mix"):
-        S["stage"] = "channels"; st.rerun()
-
-def page_channels():
-    st.subheader("Channel & GTM Mix")
-    st.caption("Allocate GTM tokens across channels. You also have optional Dev tokens to implement fixes that reduce COGS or time-to-value.")
-    left, right = st.columns([2,1])
-    with left:
-        total = 0
-        for ch in CHANNELS.keys():
-            S["gtm_alloc"][ch] = st.slider(ch, 0, 6, S["gtm_alloc"][ch])
-            total += S["gtm_alloc"][ch]
-        st.write(f"**Allocated:** {total} / {S['gtm_tokens']} GTM tokens")
-        if total > S["gtm_tokens"]:
-            st.error("You’ve allocated more than your GTM tokens. Reduce some sliders.")
-    with right:
-        S["dev_tokens"] = st.slider("Development tokens", 0, 6, S["dev_tokens"])
-        st.caption("Dev tokens reduce delivery cost/time-to-value penalties behind the scenes.")
-
-    if st.button("Simulate Q1"):
-        if total <= S["gtm_tokens"]:
-            S["stage"] = "run"; S["history"].clear(); st.rerun()
-        else:
-            st.warning("Fix token over-allocation before continuing.")
-
-def page_run():
-    st.subheader("Run Quarters & Adjust")
-    st.caption(ACRONYM_HELP)
-
-    # Controls for run
+def show_quarter(qname: str, q: QuarterOutcome):
+    st.subheader(f"{qname} Results")
     c1, c2, c3, c4 = st.columns(4)
-    price_choice = c1.selectbox("Price anchor", ["Good", "Better", "Best"], index=1)
-    price_idx = ["Good","Better","Best"].index(price_choice)
-    delivery = c2.selectbox("Delivery", list(DELIVERY.keys()), index=list(DELIVERY.keys()).index(S["delivery"]))
-    model = c3.selectbox("Model", list(REVENUE_MODELS.keys()), index=list(REVENUE_MODELS.keys()).index(S["model"]))
-    q_to_run = c4.selectbox("Quarter to run now", ["Q1","Q2","Q3","Q4"], index=len(S["history"]))
+    with c1:
+        st.metric("Visits", f"{q.visits:,}")
+        st.metric("Trials", f"{q.trials:,}")
+    with c2:
+        st.metric("Activations", f"{q.activations:,}")
+        st.metric("Paid", f"{q.paid:,}")
+    with c3:
+        st.metric("ARPU ($/mo)", f"{q.arpu:.2f}")
+        st.metric("Gross Margin", f"{int(q.gross_margin*100)}%")
+    with c4:
+        st.metric("LTV/CAC", f"{q.ltv_cac:.2f}")
+        st.metric("Payback (mo)", f"{q.payback_months:.1f}")
+    st.markdown(
+        f"- **Churn (M1):** {int(q.churn*100)}%  \n"
+        f"- **Retained (M1):** {q.retained:,}  \n"
+        f"- **CAC (effective):** ${q.cac_effective:.0f}  \n"
+        f"- **COGS per unit:** ${q.cogs_per_unit:.2f}  \n"
+        f"- **Sales cycle:** ~{q.sales_cycle_days} days  \n"
+        f"- **Cash burn (qtr):** ${q.cash_burn:,.0f}  \n"
+        f"- **Event:** {q.event}"
+    )
+    if q.notes:
+        st.markdown("**Nudges:**")
+        for n in q.notes:
+            nudge(f"- {n}", "warn")
 
-    q_index = int(q_to_run[-1])  # 1..4
-    if st.button(f"Run {q_to_run}"):
-        res = simulate_quarter(q_index, S["segment"], price_idx, delivery, model)
-        S["history"][q_index] = res
-        S["cash"] = res["cash_end"]
-        st.rerun()
+def screen_adjust_q2():
+    stepper()
+    st.header("6) Adjust & Run Quarter 2")
+    q1 = st.session_state.quarters.get("Q1")
+    if not q1:
+        nudge("No Q1 results found. Please run Quarter 1 first.", "error")
+        return
 
-    # Show latest
-    if S["history"]:
-        last_q = max(S["history"].keys())
-        res = S["history"][last_q]
-        st.markdown(f"### Results — Q{last_q}")
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Visits", res["visits"])
-        k2.metric("Trials", res["trials"])
-        k3.metric("New Paid", res["new_paid"])
-        k4.metric("Ending Paid", res["ending_paid"])
-        k5.metric("ARPU ($/mo)", res["arpu"])
+    show_quarter("Q1", q1)
 
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Gross Margin", f"{int(res['gross_margin']*100)}%")
-        m2.metric("Avg CAC ($)", res["avg_cac"])
-        m3.metric("LTV/CAC", res["ltv_cac"] if math.isfinite(res["ltv_cac"]) else "—")
-        m4.metric("Payback (mo)", res["payback_m"] if math.isfinite(res["payback_m"]) else "—")
-        m5.metric("Cash Δ ($)", res["cash_delta"])
+    st.markdown("#### Tweak your model/pricing/channels and run Q2")
+    c1, c2, c3 = st.columns([0.4, 0.35, 0.25])
+    with c1:
+        st.selectbox("Delivery level", list(DELIVERY_LEVELS.keys()), key="delivery", index=list(DELIVERY_LEVELS.keys()).index(st.session_state.delivery))
+        st.checkbox("Sales-led motion (B2B)", key="sales_led", value=st.session_state.sales_led)
+        st.slider("Paywall strictness (0 = generous, 2 = strict)", 0, 2, key="paywall", value=st.session_state.paywall)
+    with c2:
+        st.selectbox("Business model", list(MODELS.keys()), key="model", index=list(MODELS.keys()).index(st.session_state.model))
+        st.number_input("Better tier (central anchor)", min_value=0.0, key="p_better2", value=float(st.session_state.pricing["better"]), format="%.2f")
+        st.number_input("Good tier", min_value=0.0, key="p_good2", value=float(st.session_state.pricing["good"]), format="%.2f")
+        st.number_input("Best tier", min_value=0.0, key="p_best2", value=float(st.session_state.pricing["best"]), format="%.2f")
+    with c3:
+        st.slider("Onboarding polish (reduces TTV)", 0, 10, key="dev_onboarding2", value=st.session_state.dev_tokens["onboarding"])
+        st.slider("Automation investment (reduces COGS)", 0, 10, key="dev_automation2", value=st.session_state.dev_tokens["automation"])
 
-        st.markdown("**Financials (quarter):** "
-                    f"Revenue ${res['revenue']:,} • COGS ${res['cogs']:,} • CAC spend ${res['cac_spend']:,} • "
-                    f"OPEX ${res['opex']:,} • Cash end ${res['cash_end']:,}")
-        if res["events"]:
-            st.info("Events: " + " · ".join(res["events"]))
-        if res["nudges"]:
-            for n in res["nudges"]:
-                st.warning(n)
+    st.markdown("#### Channels (re-allocate)")
+    cols = st.columns(3)
+    for i, ch in enumerate(CHANNELS):
+        with cols[i % 3]:
+            st.slider(ch, 0, 100, key=f"ch2_{i}", value=st.session_state.channels[ch])
 
-    c_l, c_r = st.columns(2)
-    if c_l.button("Adjust mix (back)"):
-        S["stage"] = "channels"; st.rerun()
-    if c_r.button("Next: Decide & Document"):
-        S["stage"] = "decide"; st.rerun()
+    # Persist adjustments
+    for i, ch in enumerate(CHANNELS):
+        st.session_state.channels[ch] = st.session_state.get(f"ch2_{i}", 0)
+    st.session_state.pricing = {"good": st.session_state.p_good2, "better": st.session_state.p_better2, "best": st.session_state.p_best2}
+    st.session_state.dev_tokens = {"onboarding": st.session_state.dev_onboarding2, "automation": st.session_state.dev_automation2}
 
-def page_decide():
-    st.subheader("Decide & Document — Business Model Snapshot")
-    st.write("Summarize your choices and jot two evidence tests with clear targets.")
-    with st.form("snapshot"):
-        st.markdown(f"**ICP (segment):** {S['segment']}")
-        st.text_input("Value proposition (one sentence)",
-                      value=f"{S['value_outcome']} with a {S['promise'].lower()} promise, delivered {S['delivery'].lower()}.")
-        st.text_input("Model & pricing",
-                      value=f"{S['model']} — Good/Better/Best: ${S['price_tier']['Good']}/{S['price_tier']['Better']}/{S['price_tier']['Best']}.")
-        st.text_input("Channels (GTM summary)",
-                      value=", ".join([f"{k}:{v}" for k,v in S["gtm_alloc"].items() if v>0]) or "None")
-        st.text_input("Expected funnel metric call-outs",
-                      value="Aim LTV/CAC ≥ 3; payback ≤ 9mo (B2C) or ≤ 15mo (B2B); GM ≥ 60%.")
-        S["notes_tests"]["t1"] = st.text_input("Next test #1",
-                      value=S["notes_tests"]["t1"] or "Paywall A/B: move feature X behind paywall; target free→paid ≥ 4%.")
-        S["notes_tests"]["t2"] = st.text_input("Next test #2",
-                      value=S["notes_tests"]["t2"] or "Partner pilot: 3 partners, 4 weeks; target ≥3 weekly shares and CAC ↓ 20%.")
-        submitted = st.form_submit_button("Submit & Score")
-    if submitted:
-        S["score"] = score_run(S["history"])
-        # brief coaching
-        reasons = S["score"]["reasons"]
-        S["coach"] = [
-            "When payback is long, change the binding constraint first: price/ARPU, CAC/channel mix, or churn.",
-            "Freemium only works if the aha is fast and the paywall captures true value; otherwise pick trial→subscription.",
-            "Delivery level must match price tier; if COGS drags GM below 60%, move toward Hybrid/Automated or increase price.",
-            "Avoid GTM monocultures; one channel >60% makes you fragile. Mix 2–3 that fit your segment.",
+    if st.button("Simulate Q2", type="primary"):
+        q2 = simulate_quarter(
+            "Q2",
+            st.session_state.segment,
+            st.session_state.delivery,
+            st.session_state.model,
+            st.session_state.pricing,
+            st.session_state.paywall,
+            st.session_state.channels,
+            st.session_state.sales_led,
+            st.session_state.dev_tokens,
+            prev_q=q1,
+        )
+        st.session_state.quarters["Q2"] = q2
+        if "Q2" not in st.session_state.q_list:
+            st.session_state.q_list.append("Q2")
+        goto("decide")
+
+def screen_decide():
+    stepper()
+    st.header("7) Decide & Document")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("**Your selections**")
+        st.write(f"- **Segment:** {SEGMENTS[st.session_state.segment]['name']}")
+        sec = st.session_state.secondary_segment
+        if sec and sec != "—":
+            st.write(f"- **Secondary:** {SEGMENTS[sec]['name']}")
+        vp = st.session_state.value_prop
+        st.write(f"- **Value prop:** {vp['core_job']} → {vp['outcome']} (proof: {vp['proof']}, promise: {vp['promise']})")
+        st.write(f"- **Delivery:** {st.session_state.delivery}")
+        st.write(f"- **Unit of value:** {st.session_state.unit_value}")
+        st.write(f"- **Model:** {st.session_state.model}")
+        st.write(f"- **Pricing (G/B/B):** ${st.session_state.pricing['good']:.2f} / ${st.session_state.pricing['better']:.2f} / ${st.session_state.pricing['best']:.2f}")
+        tot, mix = channel_allocation_summary(st.session_state.channels)
+        if tot > 0:
+            mix_str = ", ".join([f"{k} {int(v*100)}%" for k, v in mix.items() if v > 0.01])
+        else:
+            mix_str = "No allocation"
+        st.write(f"- **Channels:** {mix_str}")
+        st.write(f"- **Dev tokens:** Onboarding {st.session_state.dev_tokens['onboarding']}, Automation {st.session_state.dev_tokens['automation']}")
+    with c2:
+        st.text_input("Next test #1 (metric + target)", key="next1", value=st.session_state.final.get("next1", "Paywall test: move comfort map behind paywall; goal free→paid ≥ 4%."))
+        st.text_input("Next test #2 (metric + target)", key="next2", value=st.session_state.final.get("next2", "Partner pilot: 3 HVAC partners; goal CAC −20% vs paid social."))
+        st.session_state.final = {"next1": st.session_state.next1, "next2": st.session_state.next2}
+
+    st.divider()
+    st.button("Finish & See Results", type="primary", on_click=lambda: goto("results"))
+
+def screen_results():
+    stepper()
+    st.header("Results & Feedback")
+
+    # Show quarter tables
+    if not st.session_state.quarters:
+        nudge("No results — please run Q1 (and Q2) first.", "error")
+        return
+
+    # Display Q1 and Q2
+    for qn in st.session_state.q_list:
+        show_quarter(qn, st.session_state.quarters[qn])
+
+    st.divider()
+    total, breakdown, reasons = score_sim(st.session_state.quarters)
+    st.metric("Total Score (0–100)", total)
+
+    # Category table with reasons
+    ordered = ["Model Coherence", "Unit Economics", "GTM Fit & Focus", "Iteration Quality", "Evidence Plan"]
+    rows = []
+    for cat in ordered:
+        raw = breakdown.get(cat, 0)
+        out100 = round(100 * raw / SCORES[cat])
+        rows.append({"Category": cat, "Score (/100)": out100, "Why": reasons.get(cat, "—")})
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    # Quick deltas if Q2 exists
+    if "Q1" in st.session_state.quarters and "Q2" in st.session_state.quarters:
+        q1, q2 = st.session_state.quarters["Q1"], st.session_state.quarters["Q2"]
+        st.markdown("### Q2 vs Q1 — Key Deltas")
+        delta_rows = [
+            {"Metric": "LTV/CAC", "Q1": f"{q1.ltv_cac:.2f}", "Q2": f"{q2.ltv_cac:.2f}", "Δ": f"{q2.ltv_cac - q1.ltv_cac:+.2f}"},
+            {"Metric": "Payback (mo)", "Q1": f"{q1.payback_months:.1f}", "Q2": f"{q2.payback_months:.1f}", "Δ": f"{q2.payback_months - q1.payback_months:+.1f}"},
+            {"Metric": "Churn", "Q1": f"{q1.churn:.3f}", "Q2": f"{q2.churn:.3f}", "Δ": f"{q2.churn - q1.churn:+.3f}"},
+            {"Metric": "Gross Margin", "Q1": f"{q1.gross_margin:.2f}", "Q2": f"{q2.gross_margin:.2f}", "Δ": f"{q2.gross_margin - q1.gross_margin:+.2f}"},
+            {"Metric": "Cash Burn ($)", "Q1": f"{q1.cash_burn:,.0f}", "Q2": f"{q2.cash_burn:,.0f}", "Δ": f"{q2.cash_burn - q1.cash_burn:,+.0f}"},
         ]
-        S["stage"] = "results"; st.rerun()
+        st.dataframe(pd.DataFrame(delta_rows), hide_index=True, use_container_width=True)
 
-def page_results():
-    st.subheader("Results & Coaching")
-    sc = S["score"]
-    st.metric("Total Score", f"{sc['total']}/100")
-    st.markdown("#### Category Scores")
-    for k,v in sc["components"].items():
-        label = "Excellent" if v>=0.8 else ("Good" if v>=0.6 else "Needs work")
-        st.write(f"- **{k}:** {int(v*100)}/100 — {label}")
-        st.caption(sc["reasons"][k])
+    st.divider()
+    st.markdown("### Coaching Notes")
+    coach = []
+    # Add targeted, concrete advice
+    last = st.session_state.quarters.get("Q2", st.session_state.quarters.get("Q1"))
+    if last:
+        if last.ltv_cac < 3.0:
+            coach.append("Improve LTV/CAC: raise ARPU via better tier value or reduce CAC by shifting mix to higher-fit channels.")
+        if last.payback_months > (9 if st.session_state.segment == "homeowner" else 15):
+            coach.append("Payback is long for this segment — revisit price ladder and top-of-funnel conversion to speed recovery.")
+        if last.gross_margin < 0.60:
+            coach.append("Gross margin below target — consider moving from Manual→Hybrid or investing more in automation.")
+        if last.churn > 0.08:
+            coach.append("Churn is high — accelerate time-to-value (onboarding polish), and ensure paywall aligns with the aha moment.")
+    _, mix = channel_allocation_summary(st.session_state.channels)
+    if mix and max(mix.values()) > 0.60:
+        coach.append("Your channel mix is concentrated — diversify to reduce volatility and improve resilience.")
+    if st.session_state.model == "Freemium" and last and (last.paid / max(1, last.activations)) < 0.02:
+        coach.append("Freemium conversion is weak — tighten paywall and shorten the path to aha.")
+    if not coach:
+        coach.append("Coherent choices and solid early economics — nice! Next: validate with a paywall A/B and a partner pilot.")
+    for c in coach:
+        nudge(f"- {c}")
 
-    st.markdown("#### Key Lessons")
-    for tip in S["coach"]:
-        st.write(f"- {tip}")
+    st.success("End of Simulation 3. Refresh to try a different segment, model, and mix.")
 
-    st.markdown("#### Deliverables")
-    st.write(f"- **Business Model Snapshot:** ICP={S['segment']}; Model={S['model']}; "
-             f"Price Good/Better/Best=${S['price_tier']['Good']}/{S['price_tier']['Better']}/{S['price_tier']['Best']}; "
-             f"Channels=" + (", ".join([f"{k}:{v}" for k,v in S["gtm_alloc"].items() if v>0]) or "None"))
-    st.write(f"- **Next tests:** 1) {S['notes_tests']['t1']}  2) {S['notes_tests']['t2']}")
-
-    if st.button("Restart simulation"):
-        init_state(); st.rerun()
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Flow
-# ──────────────────────────────────────────────────────────────────────────────
-def main():
-    header()
-    stage = S["stage"]
-    steps = ["intro","segment","value","pricing","channels","run","decide","results"]
-    st.progress((steps.index(stage)+1)/len(steps))
-    if stage == "intro":
-        page_intro()
-    elif stage == "segment":
-        page_segment()
-    elif stage == "value":
-        page_value()
-    elif stage == "pricing":
-        page_pricing()
-    elif stage == "channels":
-        page_channels()
-    elif stage == "run":
-        page_run()
-    elif stage == "decide":
-        page_decide()
+# ======================================================================================
+# ROUTER
+# ======================================================================================
+def router():
+    s = st.session_state.stage
+    if s == "intro":
+        screen_intro()
+    elif s == "segment":
+        screen_segment()
+    elif s == "value_prop":
+        screen_value_prop()
+    elif s == "pricing":
+        screen_pricing()
+    elif s == "channels":
+        screen_channels()
+    elif s == "run_q1":
+        screen_run_q1()
+    elif s == "adjust_q2":
+        screen_adjust_q2()
+    elif s == "decide":
+        screen_decide()
+    elif s == "results":
+        screen_results()
     else:
-        page_results()
+        screen_intro()
 
-main()
+# ======================================================================================
+# RUN
+# ======================================================================================
+router()
